@@ -4,7 +4,7 @@ This project is our attempt to reproduce, end to end, the paper by Leviathan, Ka
 
 > *Fast Inference from Transformers via Speculative Decoding* — [arXiv:2211.17192](https://arxiv.org/abs/2211.17192)
 
-There is no code here yet. This README is the plan: what the paper claims, what we want to rebuild, and how we'll know we got it right.
+The repository includes the speculative sampler, an evaluation harness, and a FastAPI T5 server. The server can run the core speculative decoder with a target/draft model pair or use Hugging Face autoregressive generation as a baseline.
 
 ## The idea in plain words
 
@@ -59,32 +59,25 @@ Notes:
 - On V100s use fp16 (no native bf16), and watch for fp16 overflow/NaNs in the larger T5 models. A100s can use bf16.
 
 
-## Hosting a model on the cluster
+## Hosting speculative decoding on the cluster
 
-`serving/` has a small FastAPI server (`/health`, `/info`, `/generate`) that serves one T5 checkpoint, plus a Dockerfile. Everyone has their own Kubernetes namespace and registry path, so all per-user settings live in `config.json`; the manifests in `k8s/*.yaml.tmpl` are templates filled in from it.
+`serving/` contains a FastAPI server (`/health`, `/info`, `/generate`) and Dockerfile. It loads one target T5 model and one draft T5 model, with a shared tokenizer, on the selected device. The Docker image includes the `speculative_decoding` package. Everyone has their own Kubernetes namespace and registry path, so per-user settings live in `config.json`; the manifests in `k8s/*.yaml.tmpl` are rendered from it.
 
-1. Copy `config.json.example` to `config.json` (it is git-ignored, so it stays yours) and set `namespace` to yours (the image becomes `registry.datexis.com/<namespace>/<image_name>:<image_tag>`) and `gpu` to the node label you want (`v100`, `a100`, `b200`, ...).
+1. Copy `config.json.example` to `config.json` (it is git-ignored, so it stays yours), set `namespace` and `gpu`, then choose `model_name`, `draft_model_name`, and the display label `served_model_name`. If you already have a `config.json`, add the `draft_model_name` field. For a useful speed comparison, set the target to a larger checkpoint than the draft, for example `google-t5/t5-base` with `google-t5/t5-small`. The example keeps both at `t5-small` for a low-resource first deployment; that verifies integration but is not expected to provide a speedup.
 2. Build and push the image: `scripts/build_push.sh`
 3. Deploy: `scripts/apply.sh` (add `--dry-run` to check first). It fills `k8s/*.yaml.tmpl` from `config.json` and pipes the result straight into `kubectl apply`, so no manifest with a hardcoded namespace is ever stored. Use `python3 scripts/render.py` to just print the YAML.
-5. Try it: `kubectl -n <namespace> port-forward svc/t5-small-server 8000:8000`, then
+4. Try it: `kubectl -n <namespace> port-forward svc/t5-small-server 8000:8000`, then
 
 ```bash
 curl -s localhost:8000/generate -H 'content-type: application/json' \
-  -d '{"text": "The house is wonderful.", "task": "translate_en_de"}'
+  -d '{"text": "The house is wonderful.", "task": "translate_en_de", "mode": "speculative", "gamma": 4}'
 ```
 
-The image is slim (just the server code). On first start the container installs its Python packages (torch etc.) into the PVC under `/cache/pylibs` and downloads the weights into `/cache/hf`; restarts reuse both.
+Speculative decoding is the default. The response includes `iterations`, `drafted_tokens`, `accepted_tokens`, and `acceptance_rate` for that mode. `gamma` is the maximum number of draft tokens proposed per target-model call (1–16). `temperature`, `top_k`, and `top_p` are applied to both model distributions by the speculative sampler. To run the autoregressive baseline instead, use `"mode": "autoregressive"`; it uses `target.generate` and retains the server's sampling behavior.
 
-**GPU type and `torch_cuda`:** `torch_cuda` in `config.json` selects the torch build that gets installed, and it has to match the GPU you pick in `gpu`:
+On first start, the container installs the pinned Python dependencies, including PyTorch, into the PVC under `/cache/pylibs` and downloads both checkpoints into `/cache/hf`; restarts reuse these files. The installation is pinned to the same PyTorch and Transformers versions as the project lockfile. The PVC must have enough room for both downloaded checkpoints, their cached files, and installed packages. Increase `pvc_size` for larger model pairs. Kubernetes requests one GPU and 8 GiB host memory by default; check GPU VRAM and host-memory needs for the combined target and draft, and adjust the deployment resources for larger checkpoints.
 
-| GPU (`gpu`) | `torch_cuda` |
-|---|---|
-| `b200`, `h100`, `h200`, `a100`, `l4`, `l40` | `cu128` (default; tested on B200) |
-| `v100` | `cu126` (**not tested yet**) |
-
-- **V100 (Volta):** the cu128 wheels have no kernels for V100, so the server would start but fail on the first `/generate` with `CUDA error: no kernel image is available`. Set `"torch_cuda": "cu126"` and `"gpu": "v100"`, run `scripts/apply.sh`. Also keep `dtype` at `float32`, since T5 can overflow in fp16.
-- **B200 (Blackwell):** needs cu128. The default PyPI torch wheel is the CUDA 12.6 build and has no Blackwell kernels, which is why we install from PyTorch's own index.
-- Changing `torch_cuda` makes the pod reinstall its packages on the next start (a few minutes).
+The `gpu` setting selects a Kubernetes node label; ensure the PyTorch wheel and the selected accelerator are compatible with your cluster's CUDA driver.
 
 ## Datasets
 
@@ -116,14 +109,11 @@ Notes:
 - The distribution check passes: speculative and standard decoding are statistically indistinguishable.
 - Everything is reproducible from a single config, so someone else can rerun it.
 
-## Planned layout
+## Implemented layout
 
-Nothing built yet, but roughly:
-
-- a minimal, readable implementation of the algorithm first (small models, easy to step through),
-- then the T5 benchmark harness for the paper's tables,
-- then analysis notebooks comparing measured results with the theory,
-- and a short write-up of what matched, what didn't, and why.
+- `src/speculative_decoding/`: sampling, cached autoregressive/speculative decoding, and evaluation utilities.
+- `serving/`: the HTTP server and image definition for target/draft inference.
+- `tests/`: decoder and sampling correctness tests, including greedy equivalence and distribution checks.
 
 ## Notes
 
