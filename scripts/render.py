@@ -15,7 +15,7 @@ from string import Template
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = ["namespace", "registry", "image_name", "image_tag", "gpu", "model_name",
-            "served_model_name", "dtype", "torch_cuda", "server_name", "pvc_name", "pvc_size",
+            "draft_model_name", "served_model_name", "dtype", "server_name", "pvc_name", "pvc_size",
             "storage_class", "access_mode", "image_pull_secret"]
 
 

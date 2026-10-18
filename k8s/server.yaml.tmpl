@@ -32,12 +32,12 @@ spec:
           env:
             - name: MODEL_NAME
               value: "${model_name}"
+            - name: DRAFT_MODEL_NAME
+              value: "${draft_model_name}"
             - name: SERVED_MODEL_NAME
               value: "${served_model_name}"
             - name: DTYPE
               value: "${dtype}"
-            - name: TORCH_CUDA
-              value: "${torch_cuda}"
             - name: HF_HOME
               value: /cache/hf
           readinessProbe:
@@ -49,12 +49,12 @@ spec:
             failureThreshold: 90   # ~15 min: first start installs packages and downloads weights
           resources:
             requests:
-              cpu: "1"
-              memory: "4Gi"
+              cpu: "2"
+              memory: "8Gi"
               nvidia.com/gpu: "1"
             limits:
-              cpu: "4"
-              memory: "16Gi"
+              cpu: "6"
+              memory: "32Gi"
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: model-cache
