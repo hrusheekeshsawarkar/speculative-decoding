@@ -1,0 +1,11 @@
+.git
+.myvenv
+.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+tests
+k8s
+scripts
+README.md
+uv.lock

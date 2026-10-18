@@ -7,7 +7,7 @@ IMAGE="$(python3 "$ROOT/scripts/render.py" --get image)"
 
 echo "Building $IMAGE"
 # linux/amd64: the cluster nodes are x86 even if you build on an Apple Silicon Mac.
-docker build --platform linux/amd64 -t "$IMAGE" "$ROOT/serving"
+docker build --platform linux/amd64 -f "$ROOT/serving/Dockerfile" -t "$IMAGE" "$ROOT"
 # Large layers sometimes drop mid-upload ("broken pipe"); finished layers are skipped on retry.
 for attempt in 1 2 3 4 5; do
   docker push "$IMAGE" && exit 0
