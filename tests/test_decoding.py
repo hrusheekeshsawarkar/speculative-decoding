@@ -95,6 +95,25 @@ def test_speculative_decode_respects_max_new_tokens(temperature: float) -> None:
         assert len(tokens) <= max_new_tokens
 
 
+def test_speculative_decode_top_k_one_matches_target_greedy() -> None:
+    target = tiny_gpt(seed=0)
+    draft = tiny_gpt(seed=1)
+    input_ids: torch.Tensor = torch.tensor([[1, 2]])
+
+    expected = autoregressive_decode(target, input_ids, temperature=1.0, max_new_tokens=5, top_k=1)
+    actual, _ = speculative_decode(
+        target,
+        draft,
+        input_ids,
+        temperature=1.0,
+        gamma=3,
+        max_new_tokens=5,
+        top_k=1,
+    )
+
+    assert actual == expected
+
+
 def tiny_gpt(seed: int) -> GPT2LMHeadModel:
     """A tiny randomly initialised model over a 6 token vocabulary, with a non-uniform output distribution."""
     torch.manual_seed(seed)

@@ -33,6 +33,34 @@ def test_standardize_rejects_negative_temperature() -> None:
         standardize(torch.randn(8), temperature=-1.0)
 
 
+def test_standardize_applies_top_k() -> None:
+    probs: torch.Tensor = standardize(torch.tensor([1.0, 3.0, 2.0]), temperature=1.0, top_k=2)
+
+    assert probs[0] == 0
+    assert probs[1] > 0
+    assert probs[2] > 0
+    assert probs.sum().item() == pytest.approx(1.0)
+
+
+def test_standardize_applies_top_p() -> None:
+    logits: torch.Tensor = torch.tensor([0.7, 0.2, 0.1]).log()
+    probs: torch.Tensor = standardize(logits, temperature=1.0, top_p=0.8)
+
+    assert probs[0] > 0
+    assert probs[1] > 0
+    assert probs[2] == 0
+    assert probs.sum().item() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("top_k", "top_p"),
+    [(0, None), (None, 0.0), (None, 1.1)],
+)
+def test_standardize_rejects_invalid_truncation_parameters(top_k: int | None, top_p: float | None) -> None:
+    with pytest.raises(ValueError):
+        standardize(torch.randn(8), temperature=1.0, top_k=top_k, top_p=top_p)
+
+
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_speculative_sample_matches_target_distribution(seed: int) -> None:
     """The returned tokens must follow p, not q, and acceptance must average sum(min(p, q))."""

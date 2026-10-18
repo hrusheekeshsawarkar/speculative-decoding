@@ -129,6 +129,8 @@ def autoregressive_decode(
     temperature: float,
     max_new_tokens: int,
     use_cache: bool = True,
+    top_k: int | None = None,
+    top_p: float | None = None,
 ) -> list[int]:
     """
     Standard autoregressive decoding with a single model, one token per model call. This is the baseline.
@@ -141,6 +143,8 @@ def autoregressive_decode(
         temperature: The sampling temperature. 0 means argmax.
         max_new_tokens: The maximum number of tokens to generate.
         use_cache: Whether to use the KV cache. Without it every call re-processes the whole sequence.
+        top_k: Keep only the `top_k` highest-scoring tokens when sampling.
+        top_p: Use nucleus sampling with cumulative probability `top_p`.
 
     Returns:
         The generated token ids, excluding the input and the decoder start token, including the EOS token if reached.
@@ -150,7 +154,7 @@ def autoregressive_decode(
     state: DecoderState = DecoderState(model, input_ids, use_cache)
 
     for _ in range(max_new_tokens):
-        probs: torch.Tensor = standardize(state.logits()[-1], temperature)
+        probs: torch.Tensor = standardize(state.logits()[-1], temperature, top_k, top_p)
         token: int = int(torch.multinomial(probs, 1).item())
         state.extend([token])
 
@@ -169,6 +173,8 @@ def speculative_decode(
     gamma: int,
     max_new_tokens: int,
     use_cache: bool = True,
+    top_k: int | None = None,
+    top_p: float | None = None,
 ) -> tuple[list[int], DecodingStats]:
     """
     Speculative decoding (Algorithm 1 of the paper). The output follows the same distribution as `target` alone.
@@ -188,6 +194,8 @@ def speculative_decode(
         gamma: The number of tokens the draft model proposes per iteration.
         max_new_tokens: The maximum number of tokens to generate.
         use_cache: Whether to use the KV cache. Without it every call re-processes the whole sequence.
+        top_k: Keep only the `top_k` highest-scoring tokens when sampling from either model.
+        top_p: Use nucleus sampling with cumulative probability `top_p` for either model.
 
     Returns:
         The generated token ids (same convention as `autoregressive_decode`) and the decoding statistics.
@@ -208,7 +216,7 @@ def speculative_decode(
         guesses: list[int] = []
         draft_probs: list[torch.Tensor] = []
         for _ in range(num_draft):
-            q: torch.Tensor = standardize(draft_state.logits()[-1], temperature)
+            q: torch.Tensor = standardize(draft_state.logits()[-1], temperature, top_k, top_p)
             guess: int = int(torch.multinomial(q, 1).item())
             draft_probs.append(q)
             guesses.append(guess)
@@ -216,7 +224,9 @@ def speculative_decode(
 
         # Run the target model once on everything it hasn't processed. The last num_draft + 1 rows are p_1 ... p_{n+1}.
         target_state.extend(guesses)
-        target_probs: torch.Tensor = standardize(target_state.logits()[-(num_draft + 1) :], temperature)
+        target_probs: torch.Tensor = standardize(
+            target_state.logits()[-(num_draft + 1) :], temperature, top_k, top_p
+        )
         stats.iterations += 1
         stats.drafted += num_draft
 
