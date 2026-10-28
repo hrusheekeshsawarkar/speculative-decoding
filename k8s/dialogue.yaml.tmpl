@@ -1,6 +1,6 @@
 # Speculative decoding of a decoder-only target (e.g. Qwen2.5-32B-Instruct) on chat prompts, the counterpart of the
 # paper's LaMDA dialog experiment. The target and draft come from `config.json`, the rest has defaults in
-# `scripts/generate_manifests.py` that `--set key=value` overrides. Rendered with:
+# `scripts/generate_manifests.py`. `--set key=value` overrides any of them. Rendered with:
 #   python3 scripts/generate_manifests.py --templates dialogue --set job_name=... --set gpu_product=...
 apiVersion: batch/v1
 kind: Job
@@ -18,28 +18,16 @@ spec:
           image: ${dockerhub_namespace}/overfitclub-speculative-decoding:latest
           imagePullPolicy: Always
           # entrypoint.sh syncs the environment into the PVC, then runs these args.
+          # The values of draft_model_name, gamma and temperature can each list several, separated by spaces, which
+          # makes a sweep over their combinations that loads the target model only once.
           args:
-            - python
-            - evaluate.py
-            - --compile
-            - reduce-overhead
-            - --static-cache
-            - --dtype
-            - bfloat16
-            - -d
-            - ${draft_model_name}
-            - -t
-            - ${target_model_name}
-            - -g
-            - "${gamma}"
-            - -k
-            - dialogue
-            - --temperature
-            - "${temperature}"
-            - --num-examples
-            - "${num_examples}"
-            - --output
-            - /cache/results/${job_name}.json
+            - sh
+            - -c
+            - >-
+              exec python evaluate.py --compile reduce-overhead --static-cache --dtype bfloat16
+              -d ${draft_model_name} -t ${target_model_name} -g ${gamma} -k dialogue
+              --temperature ${temperature} --num-examples ${num_examples}
+              --output /cache/results/${job_name}.json
           env:
             - name: TORCH_CUDA
               value: "${torch_cuda}"

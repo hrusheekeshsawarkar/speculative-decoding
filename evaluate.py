@@ -3,6 +3,7 @@ This script replicates the experiment in "Fast Inference of Transformers via Spe
 (https://arxiv.org/abs/2211.17192)
 """
 
+import gc
 import json
 import logging
 from argparse import ArgumentParser, Namespace
@@ -13,8 +14,8 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer, PreTrainedModel
 
 from speculative_decoding import Task
-from speculative_decoding.evaluation import EvaluationResult, evaluate
-from speculative_decoding.tasks import load_inputs
+from speculative_decoding.evaluation import EvaluationResult, encode, evaluate, make_runner, required_capacity
+from speculative_decoding.tasks import ModelInput, load_inputs
 
 
 def parse_arguments() -> Namespace:
@@ -31,11 +32,17 @@ def parse_arguments() -> Namespace:
         "--draft",
         "-d",
         required=True,
+        nargs="+",
         type=str,
-        help="The draft smaller model.",
+        help="The draft smaller model. Several make a sweep, which loads the target model only once.",
     )
     argparser.add_argument(
-        "--gamma", "-g", required=True, type=int, help="The number of draft tokens to sample for each target token."
+        "--gamma",
+        "-g",
+        required=True,
+        nargs="+",
+        type=int,
+        help="The number of draft tokens to sample for each target token. Several make a sweep.",
     )
     argparser.add_argument(
         "--target",
@@ -55,8 +62,9 @@ def parse_arguments() -> Namespace:
     argparser.add_argument(
         "--temperature",
         required=True,
+        nargs="+",
         type=float,
-        help="The temperature for sampling from both the draft and target models.",
+        help="The temperature for sampling from both the draft and target models. Several make a sweep.",
     )
     argparser.add_argument(
         "--num-examples",
@@ -114,7 +122,13 @@ def parse_arguments() -> Namespace:
         help="Sample all the guesses of the draft model in one call of its runner, which is one CUDA graph launch with "
         "--compile reduce-overhead. Needs --compile.",
     )
-    argparser.add_argument("--output", type=Path, default=None, help="Where to write the results as JSON.")
+    argparser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Where to write the results as JSON: one report, or a list of them for a sweep. A sweep rewrites the file "
+        "after every run, so the finished runs survive a crash.",
+    )
 
     args: Namespace = argparser.parse_args()
     if (args.static_cache or args.compile) and args.no_cache:
@@ -155,54 +169,87 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
 
     args: Namespace = parse_arguments()
-    torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")  # Allow TF32 tensor cores for float32 matmuls.
 
     device: torch.device = pick_device()
     dtype: torch.dtype = getattr(torch, args.dtype)
 
     tokenizer = AutoTokenizer.from_pretrained(args.target)
-    if AutoTokenizer.from_pretrained(args.draft).get_vocab() != tokenizer.get_vocab():
-        raise SystemExit("The draft and target models must share a vocabulary.")
+    vocabulary: dict[str, int] = tokenizer.get_vocab()
+    for draft_name in args.draft:
+        if AutoTokenizer.from_pretrained(draft_name).get_vocab() != vocabulary:
+            raise SystemExit(f"The draft model {draft_name} and the target model must share a vocabulary.")
+
+    # The target model, and what is compiled for it, are shared by every run of the sweep.
     target = load_model(args.target, dtype, device)
-    draft = load_model(args.draft, dtype, device)
-    if target.config.is_encoder_decoder != draft.config.is_encoder_decoder:
-        raise SystemExit("The draft and target models must both be encoder-decoder or both be decoder-only.")
+    inputs: list[ModelInput] = load_inputs(args.task, args.num_examples)
 
-    inputs: list[str] = load_inputs(args.task, args.num_examples)
-    result: EvaluationResult = evaluate(
-        target=target,
-        draft=draft,
-        tokenizer=tokenizer,
-        inputs=inputs,
-        temperature=args.temperature,
-        gamma=args.gamma,
-        max_new_tokens=args.max_new_tokens,
-        max_input_length=args.max_input_length,
-        run_baseline=not args.skip_baseline,
-        use_cache=not args.no_cache,
-        static_cache=args.static_cache,
-        compile_mode=args.compile,
-        encoder_bucket=args.encoder_bucket,
-        min_generated_tokens=args.min_generated_tokens or None,
-        fuse_draft=args.fuse_draft,
-    )
+    # With runners, the caches are sized for the longest input and the largest gamma, and are used by all the runs.
+    capacity: int | None = None
+    if args.compile:
+        encoded: list[torch.Tensor] = [encode(tokenizer, item, args.max_input_length) for item in inputs]
+        capacity = required_capacity(target, encoded, args.max_new_tokens, max(args.gamma))
+        target = make_runner(target, capacity, args.compile, encoder_bucket=args.encoder_bucket)
 
-    report: dict = {
-        "task": args.task.value,
-        "target": args.target,
-        "draft": args.draft,
-        "device": device.type,
-        "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-        "dtype": args.dtype,
-        "max_new_tokens": args.max_new_tokens,
-        "min_generated_tokens": args.min_generated_tokens,
-    }
-    report.update(asdict(result))
-    print(json.dumps(report, indent=2))
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, indent=2))
+    reports: list[dict] = []
+    for draft_name in args.draft:
+        draft = load_model(draft_name, dtype, device)
+        if target.config.is_encoder_decoder != draft.config.is_encoder_decoder:
+            raise SystemExit("The draft and target models must both be encoder-decoder or both be decoder-only.")
+        if args.compile:
+            draft = make_runner(draft, capacity, args.compile, encoder_bucket=args.encoder_bucket)
+
+        for temperature in args.temperature:
+            for gamma in args.gamma:
+                torch.manual_seed(args.seed)  # So that a run does not depend on the runs before it.
+                result: EvaluationResult = evaluate(
+                    target=target,
+                    draft=draft,
+                    tokenizer=tokenizer,
+                    inputs=inputs,
+                    temperature=temperature,
+                    gamma=gamma,
+                    max_new_tokens=args.max_new_tokens,
+                    max_input_length=args.max_input_length,
+                    run_baseline=not args.skip_baseline,
+                    use_cache=not args.no_cache,
+                    static_cache=args.static_cache,
+                    compile_mode=args.compile,
+                    encoder_bucket=args.encoder_bucket,
+                    min_generated_tokens=args.min_generated_tokens or None,
+                    fuse_draft=args.fuse_draft,
+                )
+
+                report: dict = {
+                    "task": args.task.value,
+                    "target": args.target,
+                    "draft": draft_name,
+                    "device": device.type,
+                    "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+                    "dtype": args.dtype,
+                    "max_new_tokens": args.max_new_tokens,
+                    "min_generated_tokens": args.min_generated_tokens,
+                }
+                report.update(asdict(result))
+                print(json.dumps(report, indent=2), flush=True)
+                reports.append(report)
+                if args.output is not None:
+                    args.output.parent.mkdir(parents=True, exist_ok=True)
+                    args.output.write_text(json.dumps(reports if is_sweep(args) else reports[0], indent=2))
+
+        # The next draft model takes its place. Its compiled steps stay cached, which costs a little GPU memory.
+        del draft
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def is_sweep(args: Namespace) -> bool:
+    """
+    Whether the arguments ask for more than one run, in which case the output is a list of reports.
+    """
+
+    return len(args.draft) * len(args.temperature) * len(args.gamma) > 1
 
 
 if __name__ == "__main__":

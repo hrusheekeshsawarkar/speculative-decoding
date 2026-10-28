@@ -10,9 +10,9 @@ import torch
 from torch._dynamo.utils import counters
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from .decoding import DecodingStats, autoregressive_decode, speculative_decode
+from .decoding import DecodingStats, autoregressive_decode, eos_token_ids, speculative_decode
 from .metrics import StepTimes, expected_speedup, expected_tokens_per_iteration, measure_step_times, synchronize
-from .runner import DecoderOnlyRunner, ModelRunner
+from .runner import BaseRunner, DecoderOnlyRunner, ModelRunner
 from .tasks import ModelInput
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -72,6 +72,43 @@ def encode(tokenizer: PreTrainedTokenizerBase, model_input: ModelInput, max_inpu
     return tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids[:, -max_input_length:]
 
 
+def required_capacity(
+    model: PreTrainedModel | BaseRunner, encoded: list[torch.Tensor], max_new_tokens: int, gamma: int
+) -> int:
+    """
+    The number of sequence positions a runner's KV cache needs for decoding these inputs.
+
+    That is the generated tokens, and the guesses that can run past the limit. An encoder-decoder model also needs a
+    position for the start token, a decoder-only model one for each token of the prompt.
+    """
+
+    generated_positions: int = max_new_tokens + gamma + 1
+    if model.config.is_encoder_decoder:
+        return 1 + generated_positions
+    return max(ids.shape[1] for ids in encoded) + generated_positions
+
+
+def make_runner(
+    model: PreTrainedModel,
+    capacity: int,
+    compile_mode: str,
+    compile_backend: str = "inductor",
+    encoder_bucket: int = 64,
+) -> BaseRunner:
+    """
+    Wrap a model in the runner of its kind. "eager" runs the runner without compiling, anything else is the `mode` of
+    `torch.compile`.
+
+    A runner can be passed to `evaluate` in place of a model, and then serves any number of evaluations. That is how a
+    sweep avoids loading and compiling the target model again for every run.
+    """
+
+    runner_mode: str | None = None if compile_mode == "eager" else compile_mode
+    if model.config.is_encoder_decoder:
+        return ModelRunner(model, capacity, runner_mode, compile_backend, encoder_bucket)
+    return DecoderOnlyRunner(model, capacity, runner_mode, compile_backend)
+
+
 def _timed(device: torch.device, function, *args, **kwargs):
     synchronize(device)
     begin: float = time.perf_counter()
@@ -81,8 +118,8 @@ def _timed(device: torch.device, function, *args, **kwargs):
 
 
 def evaluate(
-    target: PreTrainedModel,
-    draft: PreTrainedModel,
+    target: PreTrainedModel | BaseRunner,
+    draft: PreTrainedModel | BaseRunner,
     tokenizer: PreTrainedTokenizerBase,
     inputs: list[ModelInput],
     temperature: float,
@@ -106,6 +143,10 @@ def evaluate(
     decoding use the same compiled target steps). Every bucket and step length is compiled during the warmup, so that
     no compiling is timed.
 
+    Models that are already runners are used as they are, whose capacity must cover this run (see
+    `required_capacity`). With such runners and the same inputs, several evaluations run one after another without
+    compiling the steps they share again.
+
     Args:
         compile_mode: None to run the models as they are. "eager" to run them through the runners without compiling.
             Otherwise the `mode` of `torch.compile`, such as "default" or "reduce-overhead".
@@ -121,27 +162,25 @@ def evaluate(
     if fuse_draft and compile_mode is None:
         raise ValueError("Fusing the drafting loop needs the runners, so a compile mode")
 
-    device: torch.device = next(target.parameters()).device
+    device: torch.device = next((target.model if isinstance(target, BaseRunner) else target).parameters()).device
     encoded: list[torch.Tensor] = [encode(tokenizer, item, max_input_length).to(device) for item in inputs]
     # The two models can pad their output layers differently, so they are compared over the tokens of the tokenizer.
     vocab_size: int = min(len(tokenizer), target.config.vocab_size, draft.config.vocab_size)
 
     if compile_mode is not None:
-        runner_mode: str | None = None if compile_mode == "eager" else compile_mode
-        # The generated tokens, and the guesses that can run past the limit. An encoder-decoder model also needs a
-        # position for the start token, a decoder-only model one for each token of the prompt.
-        generated_positions: int = max_new_tokens + gamma + 1
-        if target.config.is_encoder_decoder:
-            capacity: int = 1 + generated_positions
-            target = ModelRunner(target, capacity, runner_mode, compile_backend, encoder_bucket)
-            draft = ModelRunner(draft, capacity, runner_mode, compile_backend, encoder_bucket)
+        capacity: int = required_capacity(target, encoded, max_new_tokens, gamma)
+        for name, model in (("target", target), ("draft", draft)):
+            if isinstance(model, BaseRunner) and model.capacity < capacity:
+                raise ValueError(f"The {name} runner holds {model.capacity} positions, this run needs {capacity}")
+        if not isinstance(target, BaseRunner):
+            target = make_runner(target, capacity, compile_mode, compile_backend, encoder_bucket)
+        if not isinstance(draft, BaseRunner):
+            draft = make_runner(draft, capacity, compile_mode, compile_backend, encoder_bucket)
 
+        if target.config.is_encoder_decoder:
             # Compile and record the graphs of every bucket that occurs, before anything is timed.
             examples: dict[int, torch.Tensor] = {target.bucket_for(ids.shape[1]): ids for ids in encoded}
         else:
-            capacity: int = max(ids.shape[1] for ids in encoded) + generated_positions
-            target = DecoderOnlyRunner(target, capacity, runner_mode, compile_backend)
-            draft = DecoderOnlyRunner(draft, capacity, runner_mode, compile_backend)
             examples: dict[int, torch.Tensor] = {0: encoded[0]}  # There are no buckets, one warmup serves all inputs.
 
         for bucket, ids in sorted(examples.items()):
@@ -162,7 +201,7 @@ def evaluate(
         target, draft, encoded[0], gamma, temperature, use_cache, static_cache=static_cache, fuse_draft=fuse_draft
     )
     cost_coefficient: float = step_times.cost_coefficient
-    eos_token_id: int | None = target.config.eos_token_id
+    eos_ids: set[int] = eos_token_ids(target)
 
     stats: DecodingStats = DecodingStats()
     generated_tokens: int = 0
@@ -192,7 +231,7 @@ def evaluate(
         generated_tokens += len(speculative_tokens)
         stats += example_stats
         decoded += 1
-        truncated += len(speculative_tokens) >= max_new_tokens and speculative_tokens[-1] != eos_token_id
+        truncated += len(speculative_tokens) >= max_new_tokens and speculative_tokens[-1] not in eos_ids
 
         if run_baseline:
             baseline_tokens, seconds = _timed(

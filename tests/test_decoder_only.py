@@ -3,13 +3,15 @@ Tests for the decoder-only path: a Qwen2 style model with a prefilled prompt, a 
 and the decoder-only runner. The models are tiny and randomly initialised, so nothing is downloaded but a tokenizer.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch._dynamo.utils import counters
 from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
 from speculative_decoding.decoding import DecoderState, autoregressive_decode, eos_token_ids, speculative_decode
-from speculative_decoding.evaluation import encode
+from speculative_decoding.evaluation import encode, evaluate, make_runner, required_capacity
 from speculative_decoding.runner import DecoderOnlyRunner, ModelRunner
 
 MAX_NEW_TOKENS: int = 12
@@ -227,3 +229,57 @@ def test_a_chat_is_tokenized_once_with_the_template() -> None:
 
     cut = encode(tokenizer, messages, max_input_length=5)
     assert cut.shape == (1, 5) and cut[0].tolist() == ids[0, -5:].tolist()  # The generation prompt is kept.
+
+
+class StubTokenizer:
+    """Turns text into ids of the tiny models, so that evaluations run without a real tokenizer."""
+
+    def __len__(self) -> int:
+        return VOCAB
+
+    def __call__(self, text: str, return_tensors=None, truncation=None, max_length=None, add_special_tokens=True):
+        ids = [1 + ord(char) % (VOCAB - 6) for char in text][:max_length]
+        return SimpleNamespace(input_ids=torch.tensor([ids]))
+
+
+SWEEP_INPUTS: list[str] = ["the house is wonderful", "good morning to you all", "a cup of tea"]
+
+
+def run(target, draft, gamma: int, temperature: float = 0.0):
+    return evaluate(
+        target=target,
+        draft=draft,
+        tokenizer=StubTokenizer(),
+        inputs=SWEEP_INPUTS,
+        temperature=temperature,
+        gamma=gamma,
+        max_new_tokens=MAX_NEW_TOKENS,
+        max_input_length=64,
+        compile_mode="default",
+        compile_backend="eager",
+    )
+
+
+def test_runners_serve_several_evaluations_of_a_sweep(target, draft) -> None:
+    """A sweep builds the runners once. Every run must come out as it does with fresh runners."""
+    encoded = [encode(StubTokenizer(), text, 64) for text in SWEEP_INPUTS]
+    capacity = required_capacity(target, encoded, MAX_NEW_TOKENS, gamma=4)
+    target_runner = make_runner(target, capacity, "default", "eager")
+    draft_runner = make_runner(draft, capacity, "default", "eager")
+
+    for gamma, temperature in ((2, 0.0), (4, 0.0), (3, 1.0), (2, 0.0)):
+        shared = run(target_runner, draft_runner, gamma, temperature)
+        assert shared.gamma == gamma and shared.temperature == temperature
+        if temperature == 0.0:
+            fresh = run(target, draft, gamma)
+            assert shared.identical_outputs == len(SWEEP_INPUTS)
+            assert shared.generated_tokens == fresh.generated_tokens
+            assert shared.alpha == fresh.alpha
+
+
+def test_a_runner_too_small_for_the_run_is_rejected(target, draft) -> None:
+    encoded = [encode(StubTokenizer(), text, 64) for text in SWEEP_INPUTS]
+    capacity = required_capacity(target, encoded, MAX_NEW_TOKENS, gamma=2)
+    small = make_runner(target, capacity, "default", "eager")
+    with pytest.raises(ValueError, match="needs"):
+        run(small, draft, gamma=6)
